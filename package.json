@@ -1,0 +1,17 @@
+{
+  "name": "giochi-websocket-backend",
+  "version": "1.0.0",
+  "description": "Backend WebSocket per Giochi Riuniti del Freddo",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.14.2",
+    "uuid": "^9.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
