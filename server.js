@@ -37,8 +37,14 @@ server.on('connection', (ws) => {
                 case 'start_game':
                     handleStartGame(ws, data);
                     break;
+                case 'give_clue':
+                    handleGiveClue(ws, data);
+                    break;
                 case 'select_word':
                     handleSelectWord(ws, data);
+                    break;
+                case 'pass_turn':
+                    handlePassTurn(ws, data);
                     break;
                 case 'change_role':
                     handleChangeRole(ws, data);
@@ -94,11 +100,14 @@ server.on('connection', (ws) => {
             creator: playerId,
             players: {},
             gameState: {
-                phase: 'lobby', // lobby, game, ended
+                phase: 'lobby', // lobby, waiting_clue, guessing, ended
                 words: generateWordGrid(),
                 redScore: 9,
                 blueScore: 8,
-                currentTurn: 'red'
+                currentTurn: 'red',
+                currentClue: null,
+                attemptsRemaining: 0,
+                gameHistory: []
             },
             createdAt: Date.now()
         };
@@ -195,7 +204,23 @@ server.on('connection', (ws) => {
             return;
         }
 
-        room.gameState.phase = 'game';
+        // Controlla che ci siano spymaster
+        const redSpy = redPlayers.find(p => p.role === 'red-spy');
+        const blueSpy = bluePlayers.find(p => p.role === 'blue-spy');
+
+        if (!redSpy || !blueSpy) {
+            ws.send(JSON.stringify({
+                type: 'start_game_error',
+                message: 'Servono spymaster in entrambe le squadre!'
+            }));
+            return;
+        }
+
+        // Inizia il gioco
+        room.gameState.phase = 'waiting_clue';
+        room.gameState.currentTurn = 'red'; // Iniziano sempre i rossi
+        room.gameState.currentClue = null;
+        room.gameState.attemptsRemaining = 0;
         
         broadcastToRoom(currentRoom, {
             type: 'game_started',
@@ -203,16 +228,84 @@ server.on('connection', (ws) => {
         });
     }
 
+    function handleGiveClue(ws, data) {
+        const room = rooms[currentRoom];
+        if (!room || room.gameState.phase !== 'waiting_clue') return;
+
+        const player = room.players[playerId];
+        const clue = data.clue;
+
+        // Solo lo spymaster del turno corrente può dare indizi
+        const expectedRole = room.gameState.currentTurn + '-spy';
+        if (player.role !== expectedRole) {
+            ws.send(JSON.stringify({
+                type: 'clue_error',
+                message: 'Non è il tuo turno per dare indizi!'
+            }));
+            return;
+        }
+
+        // Valida indizio
+        if (!clue.word || !clue.number || clue.number < 1 || clue.number > 9) {
+            ws.send(JSON.stringify({
+                type: 'clue_error',
+                message: 'Indizio non valido!'
+            }));
+            return;
+        }
+
+        // Controlla che non sia una parola sulla griglia
+        const wordExists = room.gameState.words.some(w => 
+            w.word.toLowerCase() === clue.word.toLowerCase()
+        );
+        
+        if (wordExists) {
+            ws.send(JSON.stringify({
+                type: 'clue_error',
+                message: 'Non puoi usare una parola presente sulla griglia!'
+            }));
+            return;
+        }
+
+        // Imposta indizio e cambia fase
+        room.gameState.currentClue = clue;
+        room.gameState.phase = 'guessing';
+        room.gameState.attemptsRemaining = clue.number + 1; // N+1 tentativi
+
+        // Aggiungi alla storia
+        room.gameState.gameHistory.push({
+            type: 'clue',
+            team: room.gameState.currentTurn,
+            player: player.username,
+            clue: clue,
+            timestamp: Date.now()
+        });
+
+        broadcastToRoom(currentRoom, {
+            type: 'clue_given',
+            clue: clue,
+            room: room
+        });
+    }
+
     function handleSelectWord(ws, data) {
         const room = rooms[currentRoom];
-        if (!room || room.gameState.phase !== 'game') return;
+        if (!room || room.gameState.phase !== 'guessing') return;
 
         const player = room.players[playerId];
         const wordIndex = data.word_index;
         const word = room.gameState.words[wordIndex];
 
-        // Solo agenti possono selezionare
-        if (!player.role || player.role.includes('spy')) {
+        // Validazioni
+        if (player.team !== room.gameState.currentTurn) {
+            ws.send(JSON.stringify({
+                type: 'word_error',
+                message: 'Non è il turno della tua squadra!'
+            }));
+            return;
+        }
+
+        if (player.role && player.role.includes('spy')) {
             ws.send(JSON.stringify({
                 type: 'word_error',
                 message: 'Solo gli agenti possono selezionare!'
@@ -220,10 +313,25 @@ server.on('connection', (ws) => {
             return;
         }
 
-        if (word.revealed) return;
+        if (word.revealed) {
+            ws.send(JSON.stringify({
+                type: 'word_error',
+                message: 'Parola già rivelata!'
+            }));
+            return;
+        }
+
+        if (room.gameState.attemptsRemaining <= 0) {
+            ws.send(JSON.stringify({
+                type: 'word_error',
+                message: 'Tentativi esauriti!'
+            }));
+            return;
+        }
 
         // Rivela parola
         word.revealed = true;
+        room.gameState.attemptsRemaining--;
 
         // Aggiorna punteggi
         if (word.color === 'red') {
@@ -232,10 +340,22 @@ server.on('connection', (ws) => {
             room.gameState.blueScore--;
         }
 
-        // Controlla vittoria
+        // Aggiungi alla storia
+        room.gameState.gameHistory.push({
+            type: 'word_selected',
+            team: room.gameState.currentTurn,
+            player: player.username,
+            word: word.word,
+            color: word.color,
+            timestamp: Date.now()
+        });
+
+        // Logica di gioco
         let gameEnded = false;
         let winner = null;
+        let turnEnded = false;
 
+        // Controlla vittoria/sconfitta
         if (word.color === 'assassin') {
             gameEnded = true;
             winner = player.team === 'red' ? 'blue' : 'red';
@@ -247,6 +367,18 @@ server.on('connection', (ws) => {
             winner = 'blue';
         }
 
+        // Controlla se il turno deve finire
+        if (!gameEnded) {
+            if (word.color !== player.team) {
+                // Parola sbagliata - turno finito
+                turnEnded = true;
+            } else if (room.gameState.attemptsRemaining === 0) {
+                // Tentativi esauriti - turno finito
+                turnEnded = true;
+            }
+            // Se parola corretta e ci sono ancora tentativi, continua
+        }
+
         if (gameEnded) {
             room.gameState.phase = 'ended';
             broadcastToRoom(currentRoom, {
@@ -254,13 +386,59 @@ server.on('connection', (ws) => {
                 winner: winner,
                 room: room
             });
+        } else if (turnEnded) {
+            // Cambia turno
+            changeTurn(room);
+            broadcastToRoom(currentRoom, {
+                type: 'turn_changed',
+                room: room
+            });
         } else {
+            // Continua il turno
             broadcastToRoom(currentRoom, {
                 type: 'word_selected',
                 word_index: wordIndex,
                 room: room
             });
         }
+    }
+
+    function handlePassTurn(ws, data) {
+        const room = rooms[currentRoom];
+        if (!room || room.gameState.phase !== 'guessing') return;
+
+        const player = room.players[playerId];
+
+        if (player.team !== room.gameState.currentTurn) {
+            ws.send(JSON.stringify({
+                type: 'word_error',
+                message: 'Non è il turno della tua squadra!'
+            }));
+            return;
+        }
+
+        if (player.role && player.role.includes('spy')) {
+            ws.send(JSON.stringify({
+                type: 'word_error',
+                message: 'Solo gli agenti possono passare il turno!'
+            }));
+            return;
+        }
+
+        // Cambia turno
+        changeTurn(room);
+
+        broadcastToRoom(currentRoom, {
+            type: 'turn_passed',
+            room: room
+        });
+    }
+
+    function changeTurn(room) {
+        room.gameState.currentTurn = room.gameState.currentTurn === 'red' ? 'blue' : 'red';
+        room.gameState.phase = 'waiting_clue';
+        room.gameState.currentClue = null;
+        room.gameState.attemptsRemaining = 0;
     }
 
     function handleChangeRole(ws, data) {
@@ -290,10 +468,15 @@ server.on('connection', (ws) => {
         const room = rooms[currentRoom];
         if (!room || room.creator !== playerId) return;
 
+        // Reset gioco
         room.gameState.words = generateWordGrid();
         room.gameState.redScore = 9;
         room.gameState.blueScore = 8;
-        room.gameState.phase = 'game';
+        room.gameState.phase = 'waiting_clue';
+        room.gameState.currentTurn = 'red';
+        room.gameState.currentClue = null;
+        room.gameState.attemptsRemaining = 0;
+        room.gameState.gameHistory = [];
 
         broadcastToRoom(currentRoom, {
             type: 'game_refreshed',
@@ -359,14 +542,26 @@ function generateWordGrid() {
         "GATTO", "CANE", "PESCE", "UCCELLO", "LEONE", "ELEFANTE", "TIGRE", "ORSO",
         "LUPO", "VOLPE", "CONIGLIO", "CAVALLO", "MUCCA", "PECORA", "MAIALE", "POLLO",
         "FIORE", "ROSA", "TULIPANO", "GIRASOLE", "MARGHERITA", "ORCHIDEA", "GIGLIO", "VIOLA",
-        "ROSSO", "BLU", "VERDE", "GIALLO", "NERO", "BIANCO", "GRIGIO", "ROSA",
-        "ARANCIONE", "VIOLA", "MARRONE", "ORO", "ARGENTO", "BRONZO", "PLATINO", "RAME",
-        "AUTO", "TRENO", "AEREO", "NAVE", "BICI", "MOTO", "BUS", "TAXI"
+        "ROSSO", "BLU", "VERDE", "GIALLO", "NERO", "BIANCO", "GRIGIO", "ARANCIONE",
+        "VIOLA", "MARRONE", "ORO", "ARGENTO", "BRONZO", "PLATINO", "RAME", "CRISTALLO",
+        "AUTO", "TRENO", "AEREO", "NAVE", "BICI", "MOTO", "BUS", "TAXI",
+        "METRO", "TRAM", "BARCA", "YACHT", "CAMION", "FURGONE", "SCOOTER", "SKATEBOARD",
+        "PANE", "PASTA", "PIZZA", "GELATO", "TORTA", "BISCOTTO", "CIOCCOLATO", "CARAMELLA",
+        "FRUTTA", "VERDURA", "CARNE", "PESCE", "LATTE", "FORMAGGIO", "UOVO", "RISO",
+        "LIBRO", "PENNA", "MATITA", "QUADERNO", "COMPUTER", "TELEFONO", "TELEVISIONE", "RADIO",
+        "MUSICA", "FILM", "GIOCO", "SPORT", "CALCIO", "TENNIS", "BASKET", "NUOTO",
+        "AMORE", "PACE", "GUERRA", "TEMPO", "SPAZIO", "VITA", "MORTE", "NASCITA",
+        "FAMIGLIA", "AMICO", "NEMICO", "SCUOLA", "LAVORO", "VIAGGIO", "FESTA", "COMPLEANNO",
+        "RE", "REGINA", "PRINCIPE", "PRINCIPESSA", "CAVALIERE", "DRAGO", "CASTELLO", "SPADA",
+        "SCUDO", "CORONA", "TESORO", "MAPPA", "CHIAVE", "PORTA", "FINESTRA", "PONTE",
+        "STRADA", "CITTÀ", "PAESE", "VILLAGGIO", "ISOLA", "CONTINENTE", "MONDO", "UNIVERSO",
+        "PIANETA", "SATELLITE", "COMETA", "GALASSIA", "STELLA", "ENERGIA", "FORZA", "POTERE"
     ];
 
     const shuffled = [...words].sort(() => Math.random() - 0.5);
     const gameWords = shuffled.slice(0, 25);
 
+    // Assegna colori casualmente
     const colors = [
         ...Array(9).fill('red'),
         ...Array(8).fill('blue'),
@@ -416,4 +611,4 @@ setInterval(() => {
     });
 }, 30000);
 
-console.log('✅ Server WebSocket configurato completamente!');
+console.log('✅ Server WebSocket Codenamez configurato completamente!');
