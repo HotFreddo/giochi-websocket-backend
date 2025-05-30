@@ -1,1079 +1,881 @@
-// Configurazione WebSocket
-const WS_URL = 'wss://giochi-websocket-backend.onrender.com';
+const WebSocket = require('ws');
+const { v4: uuidv4 } = require('uuid');
 
-// Variabili globali
-let currentUser = null;
-let ws = null;
-let currentRoom = null;
-let roomData = null;
-let isCreator = false;
-let currentAction = null;
-let reconnectAttempts = 0;
-let maxReconnectAttempts = 5;
-let pingInterval = null;
+const PORT = process.env.PORT || 3000;
+const server = new WebSocket.Server({ port: PORT });
 
-// Inizializzazione
-document.addEventListener('DOMContentLoaded', function() {
-    initializeApp();
-});
+// Database in memoria
+let rooms = {};
+let players = {};
 
-function initializeApp() {
-    // Controlla profilo salvato
-    const savedUser = localStorage.getItem('currentUser');
-    if (savedUser) {
-        currentUser = JSON.parse(savedUser);
-        connectWebSocket();
-        showHomePage();
-    } else {
-        showPage('profile-setup');
-    }
+console.log(`🚀 WebSocket Server avviato sulla porta ${PORT}`);
 
-    initializeEventListeners();
-}
+server.on('connection', (ws) => {
+    let playerId = null;
+    let currentRoom = null;
 
-function initializeEventListeners() {
-    // Save profile - FIX per controllo campi
-    document.getElementById('save-profile').addEventListener('click', function() {
-        const username = document.getElementById('username').value.trim();
-        
-        if (!username) {
-            showNotification('Inserisci un nome!', 'error');
-            return;
-        }
-        
-        if (username.length < 2) {
-            showNotification('Il nome deve essere di almeno 2 caratteri!', 'error');
-            return;
-        }
-        
-        createUser(username);
-        connectWebSocket();
-        showHomePage();
-    });
+    console.log('🔗 Nuova connessione WebSocket');
 
-    // Save edit profile - FIX per controllo campi
-    document.getElementById('save-edit-profile').addEventListener('click', function() {
-        const username = document.getElementById('edit-username').value.trim();
-        
-        if (!username) {
-            showNotification('Inserisci un nome!', 'error');
-            return;
-        }
-        
-        if (username.length < 2) {
-            showNotification('Il nome deve essere di almeno 2 caratteri!', 'error');
-            return;
-        }
-        
-        currentUser.username = username;
-        currentUser.updatedAt = new Date().toISOString();
-        
-        localStorage.setItem('currentUser', JSON.stringify(currentUser));
-        updateUserDisplay();
-        showProfile();
-        showNotification('Nome aggiornato!', 'success');
-    });
+    ws.on('message', (message) => {
+        try {
+            const data = JSON.parse(message.toString());
+            console.log('📨 Messaggio ricevuto:', data.type, data);
 
-    // Enter key per room code
-    document.getElementById('room-code').addEventListener('keypress', function(e) {
-        if (e.key === 'Enter' && this.value.trim()) {
-            joinRoom();
-        }
-    });
-
-    // Enter key per clue
-    document.getElementById('clue-word').addEventListener('keypress', function(e) {
-        if (e.key === 'Enter') {
-            e.preventDefault();
-            const numberInput = document.getElementById('clue-number');
-            if (numberInput.value) {
-                giveClue();
-            } else {
-                numberInput.focus();
+            switch (data.type) {
+                case 'player_connect':
+                    handlePlayerConnect(ws, data);
+                    break;
+                case 'create_room':
+                    handleCreateRoom(ws, data);
+                    break;
+                case 'join_room':
+                    handleJoinRoom(ws, data);
+                    break;
+                case 'select_role':
+                    handleSelectRole(ws, data);
+                    break;
+                case 'start_game':
+                    handleStartGame(ws, data);
+                    break;
+                case 'give_clue':
+                    handleGiveClue(ws, data);
+                    break;
+                case 'select_word':
+                    handleSelectWord(ws, data);
+                    break;
+                case 'pass_turn':
+                    handlePassTurn(ws, data);
+                    break;
+                case 'change_role':
+                    handleChangeRole(ws, data);
+                    break;
+                case 'refresh_game':
+                    handleRefreshGame(ws, data);
+                    break;
+                // SCOPA ACTIONS
+                case 'scopa_play_card':
+                    handleScopaPlayCard(ws, data);
+                    break;
+                case 'scopa_take_cards':
+                    handleScopaTakeCards(ws, data);
+                    break;
+                case 'leave_room':
+                    handleLeaveRoom(ws, data);
+                    break;
+                case 'ping':
+                    handlePing(ws, data);
+                    break;
             }
+        } catch (error) {
+            console.error('❌ Errore parsing messaggio:', error);
+            ws.send(JSON.stringify({ type: 'error', message: 'Formato messaggio non valido' }));
         }
     });
 
-    document.getElementById('clue-number').addEventListener('keypress', function(e) {
-        if (e.key === 'Enter') {
-            e.preventDefault();
-            giveClue();
+    ws.on('close', () => {
+        console.log('🔌 Connessione chiusa');
+        if (playerId && currentRoom) {
+            handlePlayerDisconnect(playerId, currentRoom);
         }
     });
-}
 
-// WEBSOCKET MANAGEMENT
-function connectWebSocket() {
-    if (ws && ws.readyState === WebSocket.OPEN) return;
-
-    showLoading('Connettendo al server...');
-
-    try {
-        ws = new WebSocket(WS_URL);
-
-        ws.onopen = function() {
-            console.log('🔗 WebSocket connesso');
-            hideLoading();
-            updateConnectionStatus(true);
-            reconnectAttempts = 0;
-
-            // Invia dati utente
-            if (currentUser) {
-                sendMessage({
-                    type: 'player_connect',
-                    player: currentUser
-                });
-            }
-
-            // Avvia ping
-            startPing();
+    // CODENAMEZ HANDLERS
+    function handlePlayerConnect(ws, data) {
+        playerId = data.player.id;
+        players[playerId] = {
+            id: playerId,
+            username: data.player.username,
+            ws: ws,
+            room: null,
+            lastPing: Date.now()
         };
 
-        ws.onmessage = function(event) {
-            try {
-                const data = JSON.parse(event.data);
-                console.log('📨 Messaggio ricevuto:', data.type, data);
-                handleWebSocketMessage(data);
-            } catch (error) {
-                console.error('❌ Errore parsing messaggio:', error);
+        ws.send(JSON.stringify({
+            type: 'player_connected',
+            success: true,
+            player_id: playerId
+        }));
+    }
+
+    function handleCreateRoom(ws, data) {
+        const roomCode = generateRoomCode();
+        const gameType = data.game_type || 'codenamez';
+        currentRoom = roomCode;
+
+        let gameState = {};
+        
+        if (gameType === 'codenamez') {
+            gameState = {
+                phase: 'lobby',
+                words: generateWordGrid(),
+                redScore: 9,
+                blueScore: 8,
+                currentTurn: 'red',
+                currentClue: null,
+                attemptsRemaining: 0,
+                gameHistory: []
+            };
+        } else if (gameType === 'scopa') {
+            gameState = {
+                phase: 'lobby',
+                deck: generateScopaDeck(),
+                tableCards: [],
+                players: {},
+                currentPlayer: 0,
+                playerOrder: [],
+                round: 1,
+                gameHistory: [],
+                scores: {}
+            };
+        }
+
+        rooms[roomCode] = {
+            id: roomCode,
+            gameType: gameType,
+            creator: playerId,
+            players: {},
+            gameState: gameState,
+            createdAt: Date.now()
+        };
+
+        // Aggiungi player alla stanza
+        rooms[roomCode].players[playerId] = {
+            ...players[playerId],
+            role: null,
+            team: null
+        };
+
+        players[playerId].room = roomCode;
+
+        ws.send(JSON.stringify({
+            type: 'room_created',
+            success: true,
+            room_code: roomCode,
+            game_type: gameType,
+            is_creator: true
+        }));
+
+        broadcastRoomUpdate(roomCode);
+    }
+
+    function handleJoinRoom(ws, data) {
+        const roomCode = data.room_code.toUpperCase();
+
+        if (!rooms[roomCode]) {
+            ws.send(JSON.stringify({
+                type: 'join_room_error',
+                message: 'Stanza non trovata'
+            }));
+            return;
+        }
+
+        currentRoom = roomCode;
+        
+        // Aggiungi player alla stanza
+        rooms[roomCode].players[playerId] = {
+            ...players[playerId],
+            role: null,
+            team: null
+        };
+
+        players[playerId].room = roomCode;
+
+        ws.send(JSON.stringify({
+            type: 'room_joined',
+            success: true,
+            room_code: roomCode,
+            game_type: rooms[roomCode].gameType,
+            is_creator: rooms[roomCode].creator === playerId
+        }));
+
+        broadcastRoomUpdate(roomCode);
+    }
+
+    function handleSelectRole(ws, data) {
+        const room = rooms[currentRoom];
+        if (!room || room.gameType !== 'codenamez') return;
+
+        const role = data.role;
+        const team = role.includes('red') ? 'red' : 'blue';
+
+        const existingPlayer = Object.values(room.players).find(p => p.role === role);
+        if (existingPlayer && existingPlayer.id !== playerId) {
+            ws.send(JSON.stringify({
+                type: 'role_error',
+                message: 'Ruolo già occupato!'
+            }));
+            return;
+        }
+
+        room.players[playerId].role = role;
+        room.players[playerId].team = team;
+
+        broadcastRoomUpdate(currentRoom);
+    }
+
+    function handleStartGame(ws, data) {
+        const room = rooms[currentRoom];
+        if (!room || room.creator !== playerId) return;
+
+        if (room.gameType === 'codenamez') {
+            startCodenamezGame(room, ws);
+        } else if (room.gameType === 'scopa') {
+            startScopaGame(room, ws);
+        }
+    }
+
+    function startCodenamezGame(room, ws) {
+        const players = Object.values(room.players);
+        const redPlayers = players.filter(p => p.team === 'red');
+        const bluePlayers = players.filter(p => p.team === 'blue');
+
+        if (redPlayers.length === 0 || bluePlayers.length === 0) {
+            ws.send(JSON.stringify({
+                type: 'start_game_error',
+                message: 'Servono giocatori in entrambe le squadre!'
+            }));
+            return;
+        }
+
+        const redSpy = redPlayers.find(p => p.role === 'red-spy');
+        const blueSpy = bluePlayers.find(p => p.role === 'blue-spy');
+
+        if (!redSpy || !blueSpy) {
+            ws.send(JSON.stringify({
+                type: 'start_game_error',
+                message: 'Servono spymaster in entrambe le squadre!'
+            }));
+            return;
+        }
+
+        room.gameState.phase = 'waiting_clue';
+        room.gameState.currentTurn = 'red';
+        room.gameState.currentClue = null;
+        room.gameState.attemptsRemaining = 0;
+        
+        broadcastToRoom(currentRoom, {
+            type: 'game_started',
+            room: room
+        });
+    }
+
+    function startScopaGame(room, ws) {
+        const playerIds = Object.keys(room.players);
+        
+        if (playerIds.length < 2 || playerIds.length > 4) {
+            ws.send(JSON.stringify({
+                type: 'start_game_error',
+                message: 'Scopa richiede 2-4 giocatori!'
+            }));
+            return;
+        }
+
+        // Inizializza gioco Scopa
+        const deck = generateScopaDeck();
+        shuffleDeck(deck);
+        
+        // 4 carte sul tavolo
+        const tableCards = deck.splice(0, 4);
+        
+        // Inizializza giocatori
+        const gameState = room.gameState;
+        gameState.phase = 'playing';
+        gameState.deck = deck;
+        gameState.tableCards = tableCards;
+        gameState.playerOrder = playerIds;
+        gameState.currentPlayer = 0;
+        gameState.round = 1;
+        gameState.players = {};
+        gameState.scores = {};
+        
+        // Dai 3 carte a ogni giocatore
+        playerIds.forEach(pid => {
+            gameState.players[pid] = {
+                hand: deck.splice(0, 3),
+                captured: [],
+                scope: 0
+            };
+            gameState.scores[pid] = 0;
+        });
+
+        broadcastToRoom(currentRoom, {
+            type: 'scopa_game_started',
+            room: room
+        });
+    }
+
+    // CODENAMEZ GAME LOGIC
+    function handleGiveClue(ws, data) {
+        const room = rooms[currentRoom];
+        if (!room || room.gameState.phase !== 'waiting_clue') return;
+
+        const player = room.players[playerId];
+        const clue = data.clue;
+
+        const expectedRole = room.gameState.currentTurn + '-spy';
+        if (player.role !== expectedRole) {
+            ws.send(JSON.stringify({
+                type: 'clue_error',
+                message: 'Non è il tuo turno per dare indizi!'
+            }));
+            return;
+        }
+
+        if (!clue.word || !clue.number || clue.number < 0 || clue.number > 9) {
+            ws.send(JSON.stringify({
+                type: 'clue_error',
+                message: 'Indizio non valido!'
+            }));
+            return;
+        }
+
+        const wordExists = room.gameState.words.some(w => 
+            w.word.toLowerCase() === clue.word.toLowerCase()
+        );
+        
+        if (wordExists) {
+            ws.send(JSON.stringify({
+                type: 'clue_error',
+                message: 'Non puoi usare una parola presente sulla griglia!'
+            }));
+            return;
+        }
+
+        room.gameState.currentClue = clue;
+        room.gameState.phase = 'guessing';
+        room.gameState.attemptsRemaining = clue.number + 1;
+
+        room.gameState.gameHistory.push({
+            type: 'clue',
+            team: room.gameState.currentTurn,
+            player: player.username,
+            clue: clue,
+            timestamp: Date.now()
+        });
+
+        broadcastToRoom(currentRoom, {
+            type: 'clue_given',
+            clue: clue,
+            room: room
+        });
+    }
+
+    function handleSelectWord(ws, data) {
+        const room = rooms[currentRoom];
+        if (!room || room.gameState.phase !== 'guessing') return;
+
+        const player = room.players[playerId];
+        const wordIndex = data.word_index;
+        const word = room.gameState.words[wordIndex];
+
+        if (player.team !== room.gameState.currentTurn) {
+            ws.send(JSON.stringify({
+                type: 'word_error',
+                message: 'Non è il turno della tua squadra!'
+            }));
+            return;
+        }
+
+        if (player.role && player.role.includes('spy')) {
+            ws.send(JSON.stringify({
+                type: 'word_error',
+                message: 'Solo gli agenti possono selezionare!'
+            }));
+            return;
+        }
+
+        if (word.revealed || room.gameState.attemptsRemaining <= 0) return;
+
+        word.revealed = true;
+        room.gameState.attemptsRemaining--;
+
+        if (word.color === 'red') {
+            room.gameState.redScore--;
+        } else if (word.color === 'blue') {
+            room.gameState.blueScore--;
+        }
+
+        room.gameState.gameHistory.push({
+            type: 'word_selected',
+            team: room.gameState.currentTurn,
+            player: player.username,
+            word: word.word,
+            color: word.color,
+            timestamp: Date.now()
+        });
+
+        let gameEnded = false;
+        let winner = null;
+        let turnEnded = false;
+        let reason = 'victory';
+
+        if (word.color === 'assassin') {
+            gameEnded = true;
+            winner = player.team === 'red' ? 'blue' : 'red';
+            reason = 'assassin';
+        } else if (room.gameState.redScore === 0) {
+            gameEnded = true;
+            winner = 'red';
+        } else if (room.gameState.blueScore === 0) {
+            gameEnded = true;
+            winner = 'blue';
+        }
+
+        if (!gameEnded) {
+            if (word.color !== player.team) {
+                turnEnded = true;
+            } else if (room.gameState.attemptsRemaining === 0) {
+                turnEnded = true;
             }
-        };
+        }
 
-        ws.onclose = function() {
-            console.log('🔌 WebSocket disconnesso');
-            updateConnectionStatus(false);
-            stopPing();
-            
-            // Tenta riconnessione
-            if (reconnectAttempts < maxReconnectAttempts) {
-                reconnectAttempts++;
-                showLoading(`Riconnettendo... (${reconnectAttempts}/${maxReconnectAttempts})`);
-                setTimeout(() => connectWebSocket(), 2000 * reconnectAttempts);
-            } else {
-                hideLoading();
-                showNotification('Connessione persa. Ricarica la pagina.', 'error');
-            }
-        };
-
-        ws.onerror = function(error) {
-            console.error('❌ Errore WebSocket:', error);
-            hideLoading();
-            showNotification('Errore di connessione', 'error');
-        };
-
-    } catch (error) {
-        console.error('❌ Errore creazione WebSocket:', error);
-        hideLoading();
-        showNotification('Impossibile connettersi al server', 'error');
-    }
-}
-
-function sendMessage(data) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(data));
-        console.log('📤 Messaggio inviato:', data.type, data);
-    } else {
-        console.error('❌ WebSocket non connesso');
-        showNotification('Connessione non disponibile', 'error');
-    }
-}
-
-function handleWebSocketMessage(data) {
-    switch (data.type) {
-        case 'player_connected':
-            console.log('✅ Player connesso:', data.player_id);
-            break;
-
-        case 'room_created':
-            handleRoomCreated(data);
-            break;
-
-        case 'room_joined':
-            handleRoomJoined(data);
-            break;
-
-        case 'join_room_error':
-            showNotification(data.message, 'error');
-            break;
-
-        case 'room_updated':
-            handleRoomUpdated(data);
-            break;
-
-        case 'role_error':
-            showNotification(data.message, 'error');
-            break;
-
-        case 'game_started':
-            handleGameStarted(data);
-            break;
-
-        case 'start_game_error':
-            showNotification(data.message, 'error');
-            break;
-
-        case 'clue_given':
-            handleClueGiven(data);
-            break;
-            
-        case 'clue_error':
-            showNotification(data.message, 'error');
-            break;
-
-        case 'word_selected':
-            handleWordSelected(data);
-            break;
-
-        case 'word_error':
-            showNotification(data.message, 'error');
-            break;
-
-        case 'turn_changed':
-            handleTurnChanged(data);
-            break;
-
-        case 'turn_passed':
-            handleTurnPassed(data);
-            break;
-
-        case 'game_ended':
-            handleGameEnded(data);
-            break;
-
-        case 'game_refreshed':
-            handleGameRefreshed(data);
-            break;
-
-        case 'room_left':
-            handleRoomLeft();
-            break;
-
-        case 'pong':
-            // Risposta al ping
-            break;
-
-        case 'error':
-            showNotification(data.message, 'error');
-            break;
-
-        default:
-            console.log('❓ Messaggio sconosciuto:', data.type);
-    }
-}
-
-function startPing() {
-    stopPing();
-    pingInterval = setInterval(() => {
-        if (currentRoom) {
-            sendMessage({
-                type: 'ping',
-                room_code: currentRoom
+        if (gameEnded) {
+            room.gameState.phase = 'ended';
+            broadcastToRoom(currentRoom, {
+                type: 'game_ended',
+                winner: winner,
+                reason: reason,
+                room: room
+            });
+        } else if (turnEnded) {
+            changeTurn(room);
+            broadcastToRoom(currentRoom, {
+                type: 'turn_changed',
+                room: room
+            });
+        } else {
+            broadcastToRoom(currentRoom, {
+                type: 'word_selected',
+                word_index: wordIndex,
+                room: room
             });
         }
-    }, 30000); // Ping ogni 30 secondi
-}
-
-function stopPing() {
-    if (pingInterval) {
-        clearInterval(pingInterval);
-        pingInterval = null;
-    }
-}
-
-// USER MANAGEMENT
-function createUser(username) {
-    currentUser = {
-        id: 'user_' + Math.random().toString(36).substr(2, 9),
-        username: username,
-        createdAt: new Date().toISOString()
-    };
-    
-    localStorage.setItem('currentUser', JSON.stringify(currentUser));
-}
-
-function updateUserDisplay() {
-    document.getElementById('user-display').textContent = currentUser.username;
-}
-
-function updateConnectionStatus(connected) {
-    const status = document.getElementById('connection-status');
-    if (status) {
-        status.textContent = connected ? '🟢' : '🔴';
-    }
-}
-
-// PAGE MANAGEMENT
-function showPage(pageId) {
-    document.querySelectorAll('.page').forEach(page => {
-        page.classList.remove('active');
-    });
-    document.getElementById(pageId).classList.add('active');
-}
-
-function showHomePage() {
-    updateUserDisplay();
-    showPage('home-page');
-    currentRoom = null;
-    roomData = null;
-    isCreator = false;
-}
-
-function showHome() {
-    if (currentRoom) {
-        leaveRoom();
-    } else {
-        showHomePage();
-    }
-}
-
-function showProfile() {
-    updateProfileDisplay();
-    showPage('profile-page');
-}
-
-function updateProfileDisplay() {
-    document.getElementById('profile-name').textContent = currentUser.username;
-}
-
-function editProfile() {
-    document.getElementById('edit-username').value = currentUser.username;
-    showPage('edit-profile');
-}
-
-function resetProfile() {
-    currentAction = () => {
-        localStorage.removeItem('currentUser');
-        currentUser = null;
-        
-        if (ws) {
-            ws.close();
-        }
-        
-        document.getElementById('username').value = '';
-        
-        showPage('profile-setup');
-    };
-    
-    showConfirmModal('Sei sicuro di voler resettare il profilo? Tutti i dati verranno persi!');
-}
-
-// GAME MANAGEMENT
-function startGame(gameName) {
-    if (gameName === 'codenamez') {
-        showPage('codenamez-setup');
-    } else if (gameName === 'culo') {
-        showNotification('GAME 2 - CULO: Coming Soon!', 'error');
-    } else {
-        showNotification('Gioco non ancora disponibile!', 'error');
-    }
-}
-
-// CODENAMEZ ROOMS
-function createRoom() {
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-        showNotification('Connessione non disponibile', 'error');
-        return;
     }
 
-    document.getElementById('create-room-btn').disabled = true;
-    
-    sendMessage({
-        type: 'create_room'
-    });
-}
+    function handlePassTurn(ws, data) {
+        const room = rooms[currentRoom];
+        if (!room || room.gameState.phase !== 'guessing') return;
 
-function joinRoom() {
-    const roomCode = document.getElementById('room-code').value.trim().toUpperCase();
-    
-    if (!roomCode) {
-        showNotification('Inserisci un codice stanza!', 'error');
-        return;
-    }
+        const player = room.players[playerId];
 
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-        showNotification('Connessione non disponibile', 'error');
-        return;
-    }
-
-    document.getElementById('join-room-btn').disabled = true;
-    
-    sendMessage({
-        type: 'join_room',
-        room_code: roomCode
-    });
-}
-
-function handleRoomCreated(data) {
-    document.getElementById('create-room-btn').disabled = false;
-    
-    if (data.success) {
-        currentRoom = data.room_code;
-        isCreator = data.is_creator;
-        showLobby();
-    }
-}
-
-function handleRoomJoined(data) {
-    document.getElementById('join-room-btn').disabled = false;
-    
-    if (data.success) {
-        currentRoom = data.room_code;
-        isCreator = data.is_creator;
-        showLobby();
-    }
-}
-
-function handleRoomUpdated(data) {
-    roomData = data.room;
-    updateLobby();
-    
-    // Se siamo in gioco, aggiorna anche quello
-    if (document.getElementById('codenamez-game').classList.contains('active')) {
-        updateGameDisplay();
-    }
-}
-
-// LOBBY MANAGEMENT
-function showLobby() {
-    document.getElementById('lobby-room-code').textContent = currentRoom;
-    showPage('codenamez-lobby');
-}
-
-function updateLobby() {
-    if (!roomData) return;
-
-    // Reset role buttons
-    document.querySelectorAll('.role-btn').forEach(btn => {
-        btn.classList.remove('selected', 'occupied');
-        btn.querySelector('.role-status').textContent = '';
-    });
-
-    // Update role states
-    Object.values(roomData.players).forEach(player => {
-        if (player.role) {
-            const roleBtn = document.getElementById(`role-${player.role}`);
-            if (roleBtn) {
-                if (player.id === currentUser.id) {
-                    roleBtn.classList.add('selected');
-                    roleBtn.querySelector('.role-status').textContent = 'TU';
-                } else {
-                    roleBtn.classList.add('occupied');
-                    roleBtn.querySelector('.role-status').textContent = player.username;
-                }
-            }
-        }
-    });
-
-    // Update teams
-    updateLobbyTeams();
-
-    // Show start button if creator and teams ready
-    if (isCreator) {
-        const redPlayers = Object.values(roomData.players).filter(p => p.team === 'red');
-        const bluePlayers = Object.values(roomData.players).filter(p => p.team === 'blue');
-        
-        const startBtn = document.getElementById('start-game-btn');
-        if (redPlayers.length > 0 && bluePlayers.length > 0) {
-            startBtn.style.display = 'block';
-        } else {
-            startBtn.style.display = 'none';
-        }
-    }
-}
-
-function updateLobbyTeams() {
-    const redList = document.getElementById('lobby-red-players');
-    const blueList = document.getElementById('lobby-blue-players');
-    
-    redList.innerHTML = '';
-    blueList.innerHTML = '';
-
-    if (!roomData) return;
-
-    Object.values(roomData.players).forEach(player => {
-        const playerDiv = document.createElement('div');
-        playerDiv.className = 'lobby-player';
-        if (player.role && player.role.includes('spy')) {
-            playerDiv.classList.add('spy');
+        if (player.team !== room.gameState.currentTurn || 
+            (player.role && player.role.includes('spy'))) {
+            return;
         }
 
-        const roleText = player.role ? 
-            (player.role.includes('spy') ? ' (SPY)' : ' (AGENTE)') : '';
-
-        playerDiv.innerHTML = `<span>${player.username}${roleText}</span>`;
-
-        if (player.team === 'red') {
-            redList.appendChild(playerDiv);
-        } else if (player.team === 'blue') {
-            blueList.appendChild(playerDiv);
-        }
-    });
-}
-
-function selectRole(role) {
-    const roleBtn = document.getElementById(`role-${role}`);
-    
-    if (roleBtn.classList.contains('occupied')) {
-        showNotification('Ruolo già occupato!', 'error');
-        return;
-    }
-
-    sendMessage({
-        type: 'select_role',
-        role: role
-    });
-}
-
-function startGameFromLobby() {
-    if (!isCreator) return;
-
-    sendMessage({
-        type: 'start_game'
-    });
-}
-
-// GAME MANAGEMENT
-function handleGameStarted(data) {
-    roomData = data.room;
-    document.getElementById('current-room-code').textContent = currentRoom;
-    
-    if (isCreator) {
-        document.getElementById('refresh-btn').style.display = 'block';
-    }
-
-    initializeGameDisplay();
-    showPage('codenamez-game');
-}
-
-function initializeGameDisplay() {
-    createWordGrid();
-    updateScores();
-    updateTeams();
-    updateGameInterface();
-    updateCluesHistory();
-}
-
-function updateGameDisplay() {
-    createWordGrid();
-    updateScores();
-    updateTeams();
-    updateGameInterface();
-    updateCluesHistory();
-}
-
-function createWordGrid() {
-    const grid = document.getElementById('words-grid');
-    grid.innerHTML = '';
-
-    if (!roomData || !roomData.gameState) return;
-
-    roomData.gameState.words.forEach((wordData, index) => {
-        const card = document.createElement('div');
-        card.className = 'word-card';
-        card.textContent = wordData.word;
-        card.onclick = () => selectWord(index);
-
-        // Spy view
-        const currentPlayerRole = getCurrentPlayerRole();
-        if (currentPlayerRole && currentPlayerRole.includes('spy')) {
-            card.classList.add('spy-view', wordData.color);
-        }
-
-        // Revealed cards
-        if (wordData.revealed) {
-            card.classList.add('revealed', wordData.color);
-        }
-
-        grid.appendChild(card);
-    });
-}
-
-function getCurrentPlayerRole() {
-    if (!roomData || !roomData.players[currentUser.id]) return null;
-    return roomData.players[currentUser.id].role;
-}
-
-// CLUE AND TURN MANAGEMENT
-function giveClue() {
-    const word = document.getElementById('clue-word').value.trim().toUpperCase();
-    const number = parseInt(document.getElementById('clue-number').value);
-    
-    if (!word) {
-        showNotification('Inserisci una parola!', 'error');
-        return;
-    }
-    
-    if (isNaN(number) || number < 0 || number > 9) {
-        showNotification('Inserisci un numero da 0 a 9!', 'error');
-        return;
-    }
-    
-    // Disabilita il bottone
-    document.getElementById('give-clue-btn').disabled = true;
-    
-    sendMessage({
-        type: 'give_clue',
-        clue: {
-            word: word,
-            number: number
-        }
-    });
-    
-    // Clear form
-    document.getElementById('clue-word').value = '';
-    document.getElementById('clue-number').value = '';
-    
-    // Riabilita dopo 2 secondi
-    setTimeout(() => {
-        document.getElementById('give-clue-btn').disabled = false;
-    }, 2000);
-}
-
-function selectWord(index) {
-    const currentPlayer = roomData.players[currentUser.id];
-    const gameState = roomData.gameState;
-    
-    // Controlla se può selezionare
-    if (currentPlayer.team !== gameState.currentTurn) {
-        showNotification('Non è il turno della tua squadra!', 'error');
-        return;
-    }
-    
-    if (currentPlayer.role && currentPlayer.role.includes('spy')) {
-        showNotification('Solo gli agenti possono selezionare!', 'error');
-        return;
-    }
-    
-    if (gameState.phase !== 'guessing') {
-        showNotification('Aspetta l\'indizio dello spymaster!', 'error');
-        return;
-    }
-    
-    if (gameState.attemptsRemaining <= 0) {
-        showNotification('Tentativi esauriti!', 'error');
-        return;
-    }
-    
-    if (roomData.gameState.words[index].revealed) return;
-
-    sendMessage({
-        type: 'select_word',
-        word_index: index
-    });
-}
-
-function passTurn() {
-    currentAction = () => {
-        sendMessage({
-            type: 'pass_turn'
+        changeTurn(room);
+        broadcastToRoom(currentRoom, {
+            type: 'turn_passed',
+            room: room
         });
-    };
-    
-    showConfirmModal('Sei sicuro di voler passare il turno?');
-}
-
-function updateGameInterface() {
-    if (!roomData || !roomData.gameState) return;
-    
-    const currentPlayer = roomData.players[currentUser.id];
-    if (!currentPlayer) return;
-    
-    const gameState = roomData.gameState;
-    const isMyTurn = currentPlayer.team === gameState.currentTurn;
-    const isSpymaster = currentPlayer.role && currentPlayer.role.includes('spy');
-    const isAgent = currentPlayer.role && !currentPlayer.role.includes('spy');
-    
-    // Update turn indicator
-    updateTurnDisplay();
-    
-    // Show/hide sections based on role and turn
-    const spymasterSection = document.getElementById('spymaster-section');
-    const agentsSection = document.getElementById('agents-section');
-    
-    if (isSpymaster && isMyTurn && gameState.phase === 'waiting_clue') {
-        spymasterSection.style.display = 'block';
-        agentsSection.style.display = 'none';
-        // Focus su input
-        setTimeout(() => {
-            document.getElementById('clue-word').focus();
-        }, 100);
-    } else if (isAgent && isMyTurn && gameState.phase === 'guessing') {
-        spymasterSection.style.display = 'none';
-        agentsSection.style.display = 'block';
-        updateClueDisplay();
-    } else {
-        spymasterSection.style.display = 'none';
-        agentsSection.style.display = 'none';
     }
-    
-    // Update word grid selectability
-    updateWordSelectability();
-}
 
-function updateTurnDisplay() {
-    if (!roomData || !roomData.gameState) return;
-    
-    const gameState = roomData.gameState;
-    const turnTeam = gameState.currentTurn === 'red' ? 'ROSSO' : 'BLU';
-    const turnDisplay = document.getElementById('current-turn-display');
-    const teamSpan = document.getElementById('turn-team');
-    const attemptsSpan = document.getElementById('attempts-count');
-    
-    teamSpan.textContent = turnTeam;
-    turnDisplay.className = `turn-display ${gameState.currentTurn}`;
-    
-    if (gameState.attemptsRemaining !== undefined) {
-        attemptsSpan.textContent = gameState.attemptsRemaining;
-    } else {
-        attemptsSpan.textContent = '0';
+    function changeTurn(room) {
+        room.gameState.currentTurn = room.gameState.currentTurn === 'red' ? 'blue' : 'red';
+        room.gameState.phase = 'waiting_clue';
+        room.gameState.currentClue = null;
+        room.gameState.attemptsRemaining = 0;
     }
-}
 
-function updateClueDisplay() {
-    if (!roomData || !roomData.gameState) return;
-    
-    const clueDisplay = document.getElementById('clue-display');
-    const currentClue = roomData.gameState.currentClue;
-    
-    if (currentClue) {
-        clueDisplay.textContent = `"${currentClue.word}" - ${currentClue.number}`;
-        clueDisplay.classList.add('active');
-    } else {
-        clueDisplay.textContent = 'In attesa dell\'indizio...';
-        clueDisplay.classList.remove('active');
-    }
-}
+    // SCOPA GAME LOGIC
+    function handleScopaPlayCard(ws, data) {
+        const room = rooms[currentRoom];
+        if (!room || room.gameType !== 'scopa' || room.gameState.phase !== 'playing') return;
 
-function updateWordSelectability() {
-    if (!roomData || !roomData.gameState) return;
-    
-    const currentPlayer = roomData.players[currentUser.id];
-    if (!currentPlayer) return;
-    
-    const gameState = roomData.gameState;
-    const canSelect = currentPlayer.team === gameState.currentTurn && 
-                     !currentPlayer.role.includes('spy') && 
-                     gameState.phase === 'guessing' &&
-                     gameState.attemptsRemaining > 0;
-    
-    document.querySelectorAll('.word-card').forEach(card => {
-        card.classList.remove('selectable', 'not-selectable');
+        const gameState = room.gameState;
+        const currentPlayerId = gameState.playerOrder[gameState.currentPlayer];
         
-        if (!card.classList.contains('revealed')) {
-            if (canSelect) {
-                card.classList.add('selectable');
+        if (playerId !== currentPlayerId) {
+            ws.send(JSON.stringify({
+                type: 'scopa_error',
+                message: 'Non è il tuo turno!'
+            }));
+            return;
+        }
+
+        const cardIndex = data.card_index;
+        const playerHand = gameState.players[playerId].hand;
+        
+        if (cardIndex < 0 || cardIndex >= playerHand.length) {
+            ws.send(JSON.stringify({
+                type: 'scopa_error',
+                message: 'Carta non valida!'
+            }));
+            return;
+        }
+
+        const playedCard = playerHand.splice(cardIndex, 1)[0];
+        
+        // Trova possibili prese
+        const possibleTakes = findScopaTakes(playedCard, gameState.tableCards);
+        
+        if (possibleTakes.length > 0) {
+            // Il giocatore deve scegliere quale presa fare
+            ws.send(JSON.stringify({
+                type: 'scopa_choose_take',
+                played_card: playedCard,
+                possible_takes: possibleTakes,
+                room: room
+            }));
+        } else {
+            // Nessuna presa possibile, la carta va sul tavolo
+            gameState.tableCards.push(playedCard);
+            nextScopaPlayer(room);
+            
+            broadcastToRoom(currentRoom, {
+                type: 'scopa_card_played',
+                played_card: playedCard,
+                player_id: playerId,
+                room: room
+            });
+        }
+    }
+
+    function handleScopaTakeCards(ws, data) {
+        const room = rooms[currentRoom];
+        if (!room || room.gameType !== 'scopa') return;
+
+        const gameState = room.gameState;
+        const playedCard = data.played_card;
+        const takenCards = data.taken_cards;
+        
+        // Verifica che la presa sia valida
+        const cardValues = takenCards.map(c => getScopaCardValue(c));
+        const totalValue = cardValues.reduce((sum, val) => sum + val, 0);
+        
+        if (totalValue !== getScopaCardValue(playedCard)) {
+            ws.send(JSON.stringify({
+                type: 'scopa_error',
+                message: 'Presa non valida!'
+            }));
+            return;
+        }
+
+        // Rimuovi carte dal tavolo
+        takenCards.forEach(card => {
+            const index = gameState.tableCards.findIndex(tc => 
+                tc.suit === card.suit && tc.value === card.value
+            );
+            if (index >= 0) {
+                gameState.tableCards.splice(index, 1);
+            }
+        });
+
+        // Aggiungi carte catturate al giocatore
+        gameState.players[playerId].captured.push(playedCard, ...takenCards);
+        
+        // Controlla SCOPA (tavolo vuoto)
+        let isScopa = false;
+        if (gameState.tableCards.length === 0) {
+            gameState.players[playerId].scope++;
+            isScopa = true;
+        }
+
+        // Controlla fine mano
+        const allHandsEmpty = gameState.playerOrder.every(pid => 
+            gameState.players[pid].hand.length === 0
+        );
+
+        if (allHandsEmpty) {
+            if (gameState.deck.length > 0) {
+                // Distribuisci nuove carte
+                gameState.playerOrder.forEach(pid => {
+                    if (gameState.deck.length > 0) {
+                        gameState.players[pid].hand.push(...gameState.deck.splice(0, 3));
+                    }
+                });
             } else {
-                card.classList.add('not-selectable');
+                // Fine partita
+                endScopaGame(room);
+                return;
+            }
+        }
+
+        nextScopaPlayer(room);
+
+        broadcastToRoom(currentRoom, {
+            type: 'scopa_cards_taken',
+            played_card: playedCard,
+            taken_cards: takenCards,
+            player_id: playerId,
+            is_scopa: isScopa,
+            room: room
+        });
+    }
+
+    function nextScopaPlayer(room) {
+        const gameState = room.gameState;
+        gameState.currentPlayer = (gameState.currentPlayer + 1) % gameState.playerOrder.length;
+    }
+
+    function endScopaGame(room) {
+        const gameState = room.gameState;
+        
+        // Calcola punteggi finali
+        const finalScores = calculateScopaScores(gameState);
+        
+        // Trova vincitore
+        let winner = null;
+        let maxScore = 0;
+        
+        Object.entries(finalScores).forEach(([pid, score]) => {
+            if (score > maxScore) {
+                maxScore = score;
+                winner = pid;
+            }
+        });
+
+        gameState.phase = 'ended';
+        gameState.finalScores = finalScores;
+        gameState.winner = winner;
+
+        broadcastToRoom(room.id, {
+            type: 'scopa_game_ended',
+            winner: winner,
+            final_scores: finalScores,
+            room: room
+        });
+    }
+
+    // COMMON HANDLERS
+    function handleChangeRole(ws, data) {
+        const room = rooms[currentRoom];
+        if (!room || room.gameType !== 'codenamez') return;
+
+        const role = data.role;
+        const team = role.includes('red') ? 'red' : 'blue';
+
+        const existingPlayer = Object.values(room.players).find(p => p.role === role);
+        if (existingPlayer && existingPlayer.id !== playerId) {
+            ws.send(JSON.stringify({
+                type: 'role_error',
+                message: 'Ruolo già occupato!'
+            }));
+            return;
+        }
+
+        room.players[playerId].role = role;
+        room.players[playerId].team = team;
+
+        broadcastRoomUpdate(currentRoom);
+    }
+
+    function handleRefreshGame(ws, data) {
+        const room = rooms[currentRoom];
+        if (!room || room.creator !== playerId) return;
+
+        if (room.gameType === 'codenamez') {
+            room.gameState.words = generateWordGrid();
+            room.gameState.redScore = 9;
+            room.gameState.blueScore = 8;
+            room.gameState.phase = 'waiting_clue';
+            room.gameState.currentTurn = 'red';
+            room.gameState.currentClue = null;
+            room.gameState.attemptsRemaining = 0;
+            room.gameState.gameHistory = [];
+        } else if (room.gameType === 'scopa') {
+            startScopaGame(room, ws);
+            return;
+        }
+
+        broadcastToRoom(currentRoom, {
+            type: 'game_refreshed',
+            room: room
+        });
+    }
+
+    function handleLeaveRoom(ws, data) {
+        if (currentRoom && rooms[currentRoom]) {
+            delete rooms[currentRoom].players[playerId];
+            
+            if (Object.keys(rooms[currentRoom].players).length === 0) {
+                delete rooms[currentRoom];
+            } else {
+                broadcastRoomUpdate(currentRoom);
+            }
+        }
+
+        if (players[playerId]) {
+            players[playerId].room = null;
+        }
+        currentRoom = null;
+
+        ws.send(JSON.stringify({
+            type: 'room_left',
+            success: true
+        }));
+    }
+
+    function handlePing(ws, data) {
+        if (players[playerId]) {
+            players[playerId].lastPing = Date.now();
+        }
+        ws.send(JSON.stringify({ type: 'pong' }));
+    }
+
+    function handlePlayerDisconnect(playerId, roomCode) {
+        if (rooms[roomCode]) {
+            delete rooms[roomCode].players[playerId];
+            
+            if (Object.keys(rooms[roomCode].players).length === 0) {
+                delete rooms[roomCode];
+            } else {
+                broadcastRoomUpdate(roomCode);
+            }
+        }
+        
+        delete players[playerId];
+    }
+});
+
+// UTILITY FUNCTIONS
+function generateRoomCode() {
+    return Math.random().toString(36).substring(2, 8).toUpperCase();
+}
+
+function generateWordGrid() {
+    const words = [
+        "CASA", "ALBERO", "MARE", "SOLE", "LUNA", "STELLE", "FUOCO", "ACQUA",
+        "TERRA", "ARIA", "MONTAGNA", "FIUME", "LAGO", "BOSCO", "DESERTO", "GHIACCIO",
+        "NEVE", "PIOGGIA", "VENTO", "NUVOLA", "TEMPORALE", "ARCOBALENO", "FULMINE", "TUONO",
+        "GATTO", "CANE", "PESCE", "UCCELLO", "LEONE", "ELEFANTE", "TIGRE", "ORSO",
+        "LUPO", "VOLPE", "CONIGLIO", "CAVALLO", "MUCCA", "PECORA", "MAIALE", "POLLO",
+        "FIORE", "ROSA", "TULIPANO", "GIRASOLE", "MARGHERITA", "ORCHIDEA", "GIGLIO", "VIOLA",
+        "ROSSO", "BLU", "VERDE", "GIALLO", "NERO", "BIANCO", "GRIGIO", "ARANCIONE",
+        "VIOLA", "MARRONE", "ORO", "ARGENTO", "BRONZO", "PLATINO", "RAME", "CRISTALLO",
+        "AUTO", "TRENO", "AEREO", "NAVE", "BICI", "MOTO", "BUS", "TAXI",
+        "METRO", "TRAM", "BARCA", "YACHT", "CAMION", "FURGONE", "SCOOTER", "SKATEBOARD"
+    ];
+
+    const shuffled = [...words].sort(() => Math.random() - 0.5);
+    const gameWords = shuffled.slice(0, 25);
+
+    const colors = [
+        ...Array(9).fill('red'),
+        ...Array(8).fill('blue'),
+        ...Array(7).fill('neutral'),
+        'assassin'
+    ];
+    colors.sort(() => Math.random() - 0.5);
+
+    return gameWords.map((word, index) => ({
+        word: word,
+        color: colors[index],
+        revealed: false
+    }));
+}
+
+// SCOPA FUNCTIONS
+function generateScopaDeck() {
+    const suits = ['coppe', 'denari', 'spade', 'bastoni'];
+    const values = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    const deck = [];
+
+    suits.forEach(suit => {
+        values.forEach(value => {
+            deck.push({ suit, value });
+        });
+    });
+
+    return deck;
+}
+
+function shuffleDeck(deck) {
+    for (let i = deck.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [deck[i], deck[j]] = [deck[j], deck[i]];
+    }
+}
+
+function getScopaCardValue(card) {
+    return card.value;
+}
+
+function findScopaTakes(playedCard, tableCards) {
+    const playedValue = getScopaCardValue(playedCard);
+    const takes = [];
+
+    // Presa singola
+    tableCards.forEach((card, index) => {
+        if (getScopaCardValue(card) === playedValue) {
+            takes.push([index]);
+        }
+    });
+
+    // Prese multiple (combinazioni che sommano al valore della carta giocata)
+    const findCombinations = (cards, target, current = [], start = 0) => {
+        if (target === 0) {
+            takes.push([...current]);
+            return;
+        }
+        
+        for (let i = start; i < cards.length; i++) {
+            const cardValue = getScopaCardValue(cards[i]);
+            if (cardValue <= target) {
+                current.push(i);
+                findCombinations(cards, target - cardValue, current, i + 1);
+                current.pop();
+            }
+        }
+    };
+
+    findCombinations(tableCards, playedValue);
+    
+    return takes.filter(take => take.length > 0);
+}
+
+function calculateScopaScores(gameState) {
+    const scores = {};
+    
+    gameState.playerOrder.forEach(pid => {
+        let score = 0;
+        const player = gameState.players[pid];
+        
+        // Scope
+        score += player.scope;
+        
+        // Carte (chi ne ha di più)
+        const cardCount = player.captured.length;
+        // TODO: implementa calcolo carte, denari, settebello, primiera
+        
+        scores[pid] = score;
+    });
+
+    return scores;
+}
+
+function broadcastRoomUpdate(roomCode) {
+    if (!rooms[roomCode]) return;
+
+    const message = {
+        type: 'room_updated',
+        room: rooms[roomCode]
+    };
+
+    broadcastToRoom(roomCode, message);
+}
+
+function broadcastToRoom(roomCode, message) {
+    if (!rooms[roomCode]) return;
+
+    Object.values(rooms[roomCode].players).forEach(player => {
+        if (players[player.id] && players[player.id].ws && players[player.id].ws.readyState === WebSocket.OPEN) {
+            players[player.id].ws.send(JSON.stringify(message));
+        }
+    });
+}
+
+// Cleanup disconnessi ogni 30 secondi
+setInterval(() => {
+    const now = Date.now();
+    Object.keys(players).forEach(playerId => {
+        if (now - players[playerId].lastPing > 60000) {
+            const roomCode = players[playerId].room;
+            if (roomCode) {
+                handlePlayerDisconnect(playerId, roomCode);
             }
         }
     });
-}
+}, 30000);
 
-function updateScores() {
-    if (!roomData || !roomData.gameState) return;
-    
-    document.getElementById('red-score').textContent = roomData.gameState.redScore;
-    document.getElementById('blue-score').textContent = roomData.gameState.blueScore;
-}
-
-function updateTeams() {
-    const redPlayers = document.getElementById('red-players');
-    const bluePlayers = document.getElementById('blue-players');
-    
-    redPlayers.innerHTML = '';
-    bluePlayers.innerHTML = '';
-
-    if (!roomData) return;
-
-    Object.values(roomData.players).forEach(player => {
-        const playerDiv = document.createElement('div');
-        playerDiv.className = 'player';
-        if (player.role && player.role.includes('spy')) {
-            playerDiv.classList.add('spy');
-        }
-
-        const roleText = player.role && player.role.includes('spy') ? ' (SPY)' : '';
-        playerDiv.textContent = `${player.username}${roleText}`;
-
-        if (player.team === 'red') {
-            redPlayers.appendChild(playerDiv);
-        } else if (player.team === 'blue') {
-            bluePlayers.appendChild(playerDiv);
-        }
-    });
-}
-
-// CLUES HISTORY MANAGEMENT
-function updateCluesHistory() {
-    if (!roomData || !roomData.gameState || !roomData.gameState.gameHistory) return;
-
-    const redCluesList = document.getElementById('red-clues-list');
-    const blueCluesList = document.getElementById('blue-clues-list');
-    
-    redCluesList.innerHTML = '';
-    blueCluesList.innerHTML = '';
-
-    // Filtra solo i suggerimenti dalla storia
-    const clues = roomData.gameState.gameHistory.filter(item => item.type === 'clue');
-    
-    clues.forEach(clueItem => {
-        const clueDiv = document.createElement('div');
-        clueDiv.className = `clue-item ${clueItem.team}`;
-        
-        clueDiv.innerHTML = `
-            <div class="clue-word">"${clueItem.clue.word}" - <span class="clue-number">${clueItem.clue.number}</span></div>
-            <div class="clue-author">da ${clueItem.player}</div>
-        `;
-        
-        if (clueItem.team === 'red') {
-            redCluesList.appendChild(clueDiv);
-        } else {
-            blueCluesList.appendChild(clueDiv);
-        }
-    });
-    
-    // Se non ci sono suggerimenti, mostra placeholder
-    if (redCluesList.children.length === 0) {
-        redCluesList.innerHTML = '<div style="opacity: 0.5; font-style: italic; text-align: center;">Nessun suggerimento</div>';
-    }
-    
-    if (blueCluesList.children.length === 0) {
-        blueCluesList.innerHTML = '<div style="opacity: 0.5; font-style: italic; text-align: center;">Nessun suggerimento</div>';
-    }
-}
-
-// GAME OVER MANAGEMENT
-function showGameOverModal(winner, reason) {
-    const modal = document.getElementById('game-over-modal');
-    const title = document.getElementById('game-over-title');
-    const message = document.getElementById('game-over-message');
-    const newGameBtn = document.getElementById('new-game-btn');
-    
-    let titleText = '';
-    let messageText = '';
-    
-    if (reason === 'assassin') {
-        titleText = 'ASSASSINO!';
-        const loserTeam = winner === 'red' ? 'BLU' : 'ROSSA';
-        messageText = `La squadra ${loserTeam} ha scelto l'assassino!\n\nVINCE LA SQUADRA ${winner.toUpperCase()}!`;
-    } else {
-        titleText = 'VITTORIA!';
-        messageText = `VINCE LA SQUADRA ${winner.toUpperCase()}!`;
-    }
-    
-    title.textContent = titleText;
-    title.className = winner === 'red' ? 'red' : 'blue';
-    message.textContent = messageText;
-    
-    // Mostra bottone "GIOCA ANCORA" solo al creatore
-    if (isCreator) {
-        newGameBtn.style.display = 'block';
-    } else {
-        newGameBtn.style.display = 'none';
-    }
-    
-    modal.classList.add('active');
-}
-
-function closeGameOverModal() {
-    document.getElementById('game-over-modal').classList.remove('active');
-}
-
-function startNewGame() {
-    closeGameOverModal();
-    
-    sendMessage({
-        type: 'refresh_game'
-    });
-}
-
-// Handler messages
-function handleClueGiven(data) {
-    roomData = data.room;
-    updateGameDisplay();
-    
-    if (data.clue) {
-        showNotification(`Indizio: "${data.clue.word}" - ${data.clue.number}`, 'success');
-    }
-}
-
-function handleWordSelected(data) {
-    roomData = data.room;
-    updateGameDisplay();
-}
-
-function handleTurnChanged(data) {
-    roomData = data.room;
-    updateGameDisplay();
-    
-    const newTeam = data.room.gameState.currentTurn === 'red' ? 'ROSSA' : 'BLU';
-    showNotification(`Turno cambiato! Ora tocca alla squadra ${newTeam}`, 'info');
-}
-
-function handleTurnPassed(data) {
-    roomData = data.room;
-    updateGameDisplay();
-    
-    const newTeam = data.room.gameState.currentTurn === 'red' ? 'ROSSA' : 'BLU';
-    showNotification(`Turno passato alla squadra ${newTeam}`, 'success');
-}
-
-function handleGameEnded(data) {
-    roomData = data.room;
-    updateGameDisplay();
-    
-    // Determina il motivo della fine partita
-    const reason = data.reason || 'victory'; // 'assassin' o 'victory'
-    
-    // Mostra modal invece del banner
-    setTimeout(() => {
-        showGameOverModal(data.winner, reason);
-    }, 1000);
-}
-
-function handleGameRefreshed(data) {
-    roomData = data.room;
-    updateGameDisplay();
-    closeGameOverModal(); // Chiudi modal se era aperto
-    showNotification('Nuova partita iniziata!', 'success');
-}
-
-// GAME MENU
-function toggleGameMenu() {
-    const menu = document.getElementById('game-menu');
-    menu.classList.toggle('active');
-}
-
-function changeRole(role) {
-    toggleGameMenu();
-    
-    let message = '';
-    switch(role) {
-        case 'red-spy':
-            message = 'Sei sicuro di voler diventare SPYMASTER ROSSO?';
-            break;
-        case 'red-agent':
-            message = 'Sei sicuro di voler diventare AGENTE ROSSO?';
-            break;
-        case 'blue-spy':
-            message = 'Sei sicuro di voler diventare SPYMASTER BLU?';
-            break;
-        case 'blue-agent':
-            message = 'Sei sicuro di voler diventare AGENTE BLU?';
-            break;
-    }
-    
-    currentAction = () => {
-        sendMessage({
-            type: 'change_role',
-            role: role
-        });
-    };
-    
-    showConfirmModal(message);
-}
-
-function refreshGame() {
-    if (!isCreator) return;
-    
-    currentAction = () => {
-        sendMessage({
-            type: 'refresh_game'
-        });
-    };
-    
-    showConfirmModal('Sei sicuro di voler generare una nuova partita?');
-}
-
-function leaveGame() {
-    toggleGameMenu();
-    
-    currentAction = () => {
-        sendMessage({
-            type: 'leave_room'
-        });
-    };
-    
-    showConfirmModal('Sei sicuro di voler tornare alla HOME?');
-}
-
-function leaveRoom() {
-    currentAction = () => {
-        sendMessage({
-            type: 'leave_room'
-        });
-    };
-    
-    showConfirmModal('Sei sicuro di voler uscire dalla stanza?');
-}
-
-function handleRoomLeft() {
-    currentRoom = null;
-    roomData = null;
-    isCreator = false;
-    document.getElementById('room-code').value = '';
-    showHomePage();
-}
-
-// UI UTILITIES
-function showLoading(text = 'Caricamento...') {
-    document.getElementById('loading-text').textContent = text;
-    document.getElementById('loading').classList.add('active');
-}
-
-function hideLoading() {
-    document.getElementById('loading').classList.remove('active');
-}
-
-function showNotification(message, type = 'info') {
-    const notification = document.getElementById('notification');
-    const notificationText = document.getElementById('notification-text');
-    
-    notification.className = `notification active ${type}`;
-    notificationText.textContent = message;
-    
-    setTimeout(() => {
-        notification.classList.remove('active');
-    }, 3000);
-}
-
-function showConfirmModal(message) {
-    document.getElementById('confirm-message').textContent = message;
-    document.getElementById('confirm-modal').classList.add('active');
-}
-
-function closeModal() {
-    document.getElementById('confirm-modal').classList.remove('active');
-    currentAction = null;
-}
-
-function confirmAction() {
-    if (currentAction) {
-        currentAction();
-        currentAction = null;
-    }
-    closeModal();
-}
-
-// EVENT LISTENERS
-document.addEventListener('click', function(e) {
-    const menu = document.getElementById('game-menu');
-    const menuBtn = document.querySelector('.menu-btn');
-    
-    if (menu && !menu.contains(e.target) && e.target !== menuBtn) {
-        menu.classList.remove('active');
-    }
-});
-
-// CLEANUP
-window.addEventListener('beforeunload', function() {
-    if (currentRoom) {
-        sendMessage({
-            type: 'leave_room'
-        });
-    }
-    
-    if (ws) {
-        ws.close();
-    }
-});
+console.log('✅ Server WebSocket Multi-Game configurato completamente!');
