@@ -52,7 +52,6 @@ server.on('connection', (ws) => {
                 case 'refresh_game':
                     handleRefreshGame(ws, data);
                     break;
-                // SCOPA ACTIONS
                 case 'scopa_play_card':
                     handleScopaPlayCard(ws, data);
                     break;
@@ -73,15 +72,16 @@ server.on('connection', (ws) => {
     });
 
     ws.on('close', () => {
-        console.log('🔌 Connessione chiusa');
+        console.log('🔌 Connessione chiusa per player:', playerId);
         if (playerId && currentRoom) {
             handlePlayerDisconnect(playerId, currentRoom);
         }
     });
 
-    // CODENAMEZ HANDLERS
     function handlePlayerConnect(ws, data) {
         playerId = data.player.id;
+        console.log('👤 Player connesso:', playerId, data.player.username);
+        
         players[playerId] = {
             id: playerId,
             username: data.player.username,
@@ -101,6 +101,8 @@ server.on('connection', (ws) => {
         const roomCode = generateRoomCode();
         const gameType = data.game_type || 'codenamez';
         currentRoom = roomCode;
+
+        console.log('🏠 Creando stanza:', roomCode, 'tipo:', gameType, 'creatore:', playerId);
 
         let gameState = {};
         
@@ -140,7 +142,8 @@ server.on('connection', (ws) => {
 
         // Aggiungi player alla stanza
         rooms[roomCode].players[playerId] = {
-            ...players[playerId],
+            id: playerId,
+            username: players[playerId].username,
             role: null,
             team: null
         };
@@ -155,13 +158,16 @@ server.on('connection', (ws) => {
             is_creator: true
         }));
 
+        console.log('✅ Stanza creata:', roomCode, 'giocatori:', Object.keys(rooms[roomCode].players));
         broadcastRoomUpdate(roomCode);
     }
 
     function handleJoinRoom(ws, data) {
         const roomCode = data.room_code.toUpperCase();
+        console.log('🚪 Tentativo join stanza:', roomCode, 'player:', playerId);
 
         if (!rooms[roomCode]) {
+            console.log('❌ Stanza non trovata:', roomCode);
             ws.send(JSON.stringify({
                 type: 'join_room_error',
                 message: 'Stanza non trovata'
@@ -169,16 +175,24 @@ server.on('connection', (ws) => {
             return;
         }
 
+        // Controlla se il player è già nella stanza
+        if (rooms[roomCode].players[playerId]) {
+            console.log('⚠️ Player già nella stanza:', playerId);
+        }
+
         currentRoom = roomCode;
         
         // Aggiungi player alla stanza
         rooms[roomCode].players[playerId] = {
-            ...players[playerId],
+            id: playerId,
+            username: players[playerId].username,
             role: null,
             team: null
         };
 
         players[playerId].room = roomCode;
+
+        console.log('✅ Player aggiunto alla stanza:', roomCode, 'giocatori totali:', Object.keys(rooms[roomCode].players).length);
 
         ws.send(JSON.stringify({
             type: 'room_joined',
@@ -198,6 +212,8 @@ server.on('connection', (ws) => {
         const role = data.role;
         const team = role.includes('red') ? 'red' : 'blue';
 
+        console.log('🎭 Selezione ruolo:', role, 'player:', playerId);
+
         const existingPlayer = Object.values(room.players).find(p => p.role === role);
         if (existingPlayer && existingPlayer.id !== playerId) {
             ws.send(JSON.stringify({
@@ -210,12 +226,15 @@ server.on('connection', (ws) => {
         room.players[playerId].role = role;
         room.players[playerId].team = team;
 
+        console.log('✅ Ruolo assegnato:', role, 'a player:', playerId);
         broadcastRoomUpdate(currentRoom);
     }
 
     function handleStartGame(ws, data) {
         const room = rooms[currentRoom];
         if (!room || room.creator !== playerId) return;
+
+        console.log('🎮 Avvio gioco:', room.gameType, 'stanza:', currentRoom);
 
         if (room.gameType === 'codenamez') {
             startCodenamezGame(room, ws);
@@ -225,9 +244,11 @@ server.on('connection', (ws) => {
     }
 
     function startCodenamezGame(room, ws) {
-        const players = Object.values(room.players);
-        const redPlayers = players.filter(p => p.team === 'red');
-        const bluePlayers = players.filter(p => p.team === 'blue');
+        const playersList = Object.values(room.players);
+        const redPlayers = playersList.filter(p => p.team === 'red');
+        const bluePlayers = playersList.filter(p => p.team === 'blue');
+
+        console.log('🔴 Giocatori rossi:', redPlayers.length, '🔵 Giocatori blu:', bluePlayers.length);
 
         if (redPlayers.length === 0 || bluePlayers.length === 0) {
             ws.send(JSON.stringify({
@@ -253,6 +274,7 @@ server.on('connection', (ws) => {
         room.gameState.currentClue = null;
         room.gameState.attemptsRemaining = 0;
         
+        console.log('✅ Gioco Codenamez avviato per stanza:', currentRoom);
         broadcastToRoom(currentRoom, {
             type: 'game_started',
             room: room
@@ -262,6 +284,8 @@ server.on('connection', (ws) => {
     function startScopaGame(room, ws) {
         const playerIds = Object.keys(room.players);
         
+        console.log('🃏 Avvio Scopa con giocatori:', playerIds.length);
+
         if (playerIds.length < 2 || playerIds.length > 4) {
             ws.send(JSON.stringify({
                 type: 'start_game_error',
@@ -270,14 +294,11 @@ server.on('connection', (ws) => {
             return;
         }
 
-        // Inizializza gioco Scopa
         const deck = generateScopaDeck();
         shuffleDeck(deck);
         
-        // 4 carte sul tavolo
         const tableCards = deck.splice(0, 4);
         
-        // Inizializza giocatori
         const gameState = room.gameState;
         gameState.phase = 'playing';
         gameState.deck = deck;
@@ -288,7 +309,6 @@ server.on('connection', (ws) => {
         gameState.players = {};
         gameState.scores = {};
         
-        // Dai 3 carte a ogni giocatore
         playerIds.forEach(pid => {
             gameState.players[pid] = {
                 hand: deck.splice(0, 3),
@@ -298,13 +318,13 @@ server.on('connection', (ws) => {
             gameState.scores[pid] = 0;
         });
 
+        console.log('✅ Gioco Scopa avviato per stanza:', currentRoom);
         broadcastToRoom(currentRoom, {
             type: 'scopa_game_started',
             room: room
         });
     }
 
-    // CODENAMEZ GAME LOGIC
     function handleGiveClue(ws, data) {
         const room = rooms[currentRoom];
         if (!room || room.gameState.phase !== 'waiting_clue') return;
@@ -321,7 +341,7 @@ server.on('connection', (ws) => {
             return;
         }
 
-        if (!clue.word || !clue.number || clue.number < 0 || clue.number > 9) {
+        if (!clue.word || clue.number < 0 || clue.number > 9) {
             ws.send(JSON.stringify({
                 type: 'clue_error',
                 message: 'Indizio non valido!'
@@ -477,7 +497,6 @@ server.on('connection', (ws) => {
         room.gameState.attemptsRemaining = 0;
     }
 
-    // SCOPA GAME LOGIC
     function handleScopaPlayCard(ws, data) {
         const room = rooms[currentRoom];
         if (!room || room.gameType !== 'scopa' || room.gameState.phase !== 'playing') return;
@@ -506,11 +525,9 @@ server.on('connection', (ws) => {
 
         const playedCard = playerHand.splice(cardIndex, 1)[0];
         
-        // Trova possibili prese
         const possibleTakes = findScopaTakes(playedCard, gameState.tableCards);
         
         if (possibleTakes.length > 0) {
-            // Il giocatore deve scegliere quale presa fare
             ws.send(JSON.stringify({
                 type: 'scopa_choose_take',
                 played_card: playedCard,
@@ -518,7 +535,6 @@ server.on('connection', (ws) => {
                 room: room
             }));
         } else {
-            // Nessuna presa possibile, la carta va sul tavolo
             gameState.tableCards.push(playedCard);
             nextScopaPlayer(room);
             
@@ -537,22 +553,16 @@ server.on('connection', (ws) => {
 
         const gameState = room.gameState;
         const playedCard = data.played_card;
-        const takenCards = data.taken_cards;
+        const takenCards = data.taken_cards || [];
         
-        // Verifica che la presa sia valida
-        const cardValues = takenCards.map(c => getScopaCardValue(c));
-        const totalValue = cardValues.reduce((sum, val) => sum + val, 0);
+        // Per semplicità, prendiamo tutte le carte che hanno lo stesso valore
+        const cardValue = getScopaCardValue(playedCard);
+        const cardsToTake = gameState.tableCards.filter(card => 
+            getScopaCardValue(card) === cardValue
+        );
         
-        if (totalValue !== getScopaCardValue(playedCard)) {
-            ws.send(JSON.stringify({
-                type: 'scopa_error',
-                message: 'Presa non valida!'
-            }));
-            return;
-        }
-
         // Rimuovi carte dal tavolo
-        takenCards.forEach(card => {
+        cardsToTake.forEach(card => {
             const index = gameState.tableCards.findIndex(tc => 
                 tc.suit === card.suit && tc.value === card.value
             );
@@ -562,16 +572,33 @@ server.on('connection', (ws) => {
         });
 
         // Aggiungi carte catturate al giocatore
-        gameState.players[playerId].captured.push(playedCard, ...takenCards);
+        gameState.players[playerId].captured.push(playedCard, ...cardsToTake);
         
-        // Controlla SCOPA (tavolo vuoto)
+        // Controlla SCOPA
         let isScopa = false;
         if (gameState.tableCards.length === 0) {
-            gameState.players[playerId].scope++;
+            gameState.players[playerId].scope = (gameState.players[playerId].scope || 0) + 1;
             isScopa = true;
         }
 
-        // Controlla fine mano
+        nextScopaPlayer(room);
+
+        broadcastToRoom(currentRoom, {
+            type: 'scopa_cards_taken',
+            played_card: playedCard,
+            taken_cards: cardsToTake,
+            player_id: playerId,
+            is_scopa: isScopa,
+            room: room
+        });
+
+        // Controlla fine partita
+        checkScopaGameEnd(room);
+    }
+
+    function checkScopaGameEnd(room) {
+        const gameState = room.gameState;
+        
         const allHandsEmpty = gameState.playerOrder.every(pid => 
             gameState.players[pid].hand.length === 0
         );
@@ -580,27 +607,16 @@ server.on('connection', (ws) => {
             if (gameState.deck.length > 0) {
                 // Distribuisci nuove carte
                 gameState.playerOrder.forEach(pid => {
-                    if (gameState.deck.length > 0) {
-                        gameState.players[pid].hand.push(...gameState.deck.splice(0, 3));
+                    const cardsToGive = Math.min(3, gameState.deck.length);
+                    if (cardsToGive > 0) {
+                        gameState.players[pid].hand.push(...gameState.deck.splice(0, cardsToGive));
                     }
                 });
             } else {
                 // Fine partita
                 endScopaGame(room);
-                return;
             }
         }
-
-        nextScopaPlayer(room);
-
-        broadcastToRoom(currentRoom, {
-            type: 'scopa_cards_taken',
-            played_card: playedCard,
-            taken_cards: takenCards,
-            player_id: playerId,
-            is_scopa: isScopa,
-            room: room
-        });
     }
 
     function nextScopaPlayer(room) {
@@ -637,7 +653,6 @@ server.on('connection', (ws) => {
         });
     }
 
-    // COMMON HANDLERS
     function handleChangeRole(ws, data) {
         const room = rooms[currentRoom];
         if (!room || room.gameType !== 'codenamez') return;
@@ -685,10 +700,16 @@ server.on('connection', (ws) => {
     }
 
     function handleLeaveRoom(ws, data) {
+        console.log('🚪 Player lascia stanza:', playerId, 'da stanza:', currentRoom);
+        
         if (currentRoom && rooms[currentRoom]) {
             delete rooms[currentRoom].players[playerId];
             
-            if (Object.keys(rooms[currentRoom].players).length === 0) {
+            const remainingPlayers = Object.keys(rooms[currentRoom].players).length;
+            console.log('👥 Giocatori rimasti:', remainingPlayers);
+            
+            if (remainingPlayers === 0) {
+                console.log('🗑️ Eliminando stanza vuota:', currentRoom);
                 delete rooms[currentRoom];
             } else {
                 broadcastRoomUpdate(currentRoom);
@@ -714,10 +735,13 @@ server.on('connection', (ws) => {
     }
 
     function handlePlayerDisconnect(playerId, roomCode) {
+        console.log('💔 Player disconnesso:', playerId, 'da stanza:', roomCode);
+        
         if (rooms[roomCode]) {
             delete rooms[roomCode].players[playerId];
             
             if (Object.keys(rooms[roomCode].players).length === 0) {
+                console.log('🗑️ Eliminando stanza vuota dopo disconnect:', roomCode);
                 delete rooms[roomCode];
             } else {
                 broadcastRoomUpdate(roomCode);
@@ -742,9 +766,7 @@ function generateWordGrid() {
         "LUPO", "VOLPE", "CONIGLIO", "CAVALLO", "MUCCA", "PECORA", "MAIALE", "POLLO",
         "FIORE", "ROSA", "TULIPANO", "GIRASOLE", "MARGHERITA", "ORCHIDEA", "GIGLIO", "VIOLA",
         "ROSSO", "BLU", "VERDE", "GIALLO", "NERO", "BIANCO", "GRIGIO", "ARANCIONE",
-        "VIOLA", "MARRONE", "ORO", "ARGENTO", "BRONZO", "PLATINO", "RAME", "CRISTALLO",
-        "AUTO", "TRENO", "AEREO", "NAVE", "BICI", "MOTO", "BUS", "TAXI",
-        "METRO", "TRAM", "BARCA", "YACHT", "CAMION", "FURGONE", "SCOOTER", "SKATEBOARD"
+        "VIOLA", "MARRONE", "ORO", "ARGENTO", "BRONZO", "PLATINO", "RAME", "CRISTALLO"
     ];
 
     const shuffled = [...words].sort(() => Math.random() - 0.5);
@@ -765,7 +787,6 @@ function generateWordGrid() {
     }));
 }
 
-// SCOPA FUNCTIONS
 function generateScopaDeck() {
     const suits = ['coppe', 'denari', 'spade', 'bastoni'];
     const values = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
@@ -802,26 +823,7 @@ function findScopaTakes(playedCard, tableCards) {
         }
     });
 
-    // Prese multiple (combinazioni che sommano al valore della carta giocata)
-    const findCombinations = (cards, target, current = [], start = 0) => {
-        if (target === 0) {
-            takes.push([...current]);
-            return;
-        }
-        
-        for (let i = start; i < cards.length; i++) {
-            const cardValue = getScopaCardValue(cards[i]);
-            if (cardValue <= target) {
-                current.push(i);
-                findCombinations(cards, target - cardValue, current, i + 1);
-                current.pop();
-            }
-        }
-    };
-
-    findCombinations(tableCards, playedValue);
-    
-    return takes.filter(take => take.length > 0);
+    return takes;
 }
 
 function calculateScopaScores(gameState) {
@@ -832,11 +834,13 @@ function calculateScopaScores(gameState) {
         const player = gameState.players[pid];
         
         // Scope
-        score += player.scope;
+        score += player.scope || 0;
         
-        // Carte (chi ne ha di più)
-        const cardCount = player.captured.length;
-        // TODO: implementa calcolo carte, denari, settebello, primiera
+        // Carte (chi ne ha di più prende 1 punto)
+        const cardCount = player.captured ? player.captured.length : 0;
+        
+        // Semplificato: 1 punto per ogni 5 carte catturate + scope
+        score += Math.floor(cardCount / 5);
         
         scores[pid] = score;
     });
@@ -846,6 +850,8 @@ function calculateScopaScores(gameState) {
 
 function broadcastRoomUpdate(roomCode) {
     if (!rooms[roomCode]) return;
+
+    console.log('📡 Broadcasting room update per stanza:', roomCode, 'a', Object.keys(rooms[roomCode].players).length, 'giocatori');
 
     const message = {
         type: 'room_updated',
@@ -858,11 +864,15 @@ function broadcastRoomUpdate(roomCode) {
 function broadcastToRoom(roomCode, message) {
     if (!rooms[roomCode]) return;
 
+    let sentCount = 0;
     Object.values(rooms[roomCode].players).forEach(player => {
         if (players[player.id] && players[player.id].ws && players[player.id].ws.readyState === WebSocket.OPEN) {
             players[player.id].ws.send(JSON.stringify(message));
+            sentCount++;
         }
     });
+    
+    console.log('📤 Messaggio inviato a', sentCount, 'giocatori nella stanza', roomCode);
 }
 
 // Cleanup disconnessi ogni 30 secondi
@@ -872,6 +882,7 @@ setInterval(() => {
         if (now - players[playerId].lastPing > 60000) {
             const roomCode = players[playerId].room;
             if (roomCode) {
+                console.log('⏰ Cleanup player inattivo:', playerId);
                 handlePlayerDisconnect(playerId, roomCode);
             }
         }
@@ -879,3 +890,13 @@ setInterval(() => {
 }, 30000);
 
 console.log('✅ Server WebSocket Multi-Game configurato completamente!');
+
+// Debug: mostra stanze attive ogni 60 secondi
+setInterval(() => {
+    const activeRooms = Object.keys(rooms);
+    console.log('🏠 Stanze attive:', activeRooms.length);
+    activeRooms.forEach(roomCode => {
+        const room = rooms[roomCode];
+        console.log(`  - ${roomCode} (${room.gameType}): ${Object.keys(room.players).length} giocatori`);
+    });
+}, 60000);
